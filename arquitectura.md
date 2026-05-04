@@ -170,9 +170,11 @@ sequenceDiagram
     participant GW as API Gateway
     participant DB as PostgreSQL
 
-    A->>FE: Selecciona secreto → gestionar accesos → elige usuario
-    FE->>GW: POST /api/v1/secrets/{id}/access + JWT\n{user_ids: [...]}
-    GW->>GW: Valida JWT + rol\n(viewer bloqueado; editor solo puede asignar a viewers)
+    A->>FE: Selecciona secreto, gestionar accesos, elige usuario
+    FE->>GW: POST /api/v1/secrets/{id}/access + JWT
+    Note over FE,GW: Body: {user_ids: [...]}
+    GW->>GW: Valida JWT + rol (viewer bloqueado)
+    Note over GW: Editor solo puede asignar a viewers
     GW->>DB: SELECT secret WHERE id=? (verifica existencia y propiedad)
     GW->>DB: INSERT secret_access (secret_id, granted_to, granted_by)
     GW->>DB: INSERT audit_log (GRANT_ACCESS)
@@ -404,3 +406,4 @@ El API Gateway publica eventos en la queue `secret_events` tras cada operación 
 ### Audit Log como append-only por convención
 
 El audit log se implementa como `INSERT`-only a nivel de aplicación: ningún endpoint expone operaciones de `UPDATE` o `DELETE` sobre `audit_logs`. No existe un constraint de base de datos que lo fuerce técnicamente, por lo que la garantía de inmutabilidad depende de que no se otorguen permisos directos de escritura a la tabla fuera de la aplicación.
+
