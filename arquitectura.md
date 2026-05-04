@@ -5,10 +5,12 @@
 SecureVault implementa una **arquitectura de microservicios** donde cada componente tiene una responsabilidad única y se comunica a través de interfaces bien definidas: HTTP/REST para comunicación sincrónica y AMQP (RabbitMQ) para comunicación asíncrona.
 
 ### Principios de diseño
+
 - **Separación de responsabilidades**: cada servicio hace una sola cosa bien
 - **Comunicación asíncrona**: el worker no bloquea al API gateway
 - **Cifrado en reposo**: los valores de los secretos se cifran con Fernet (AES-128-CBC) antes de persistirse
 - **Principio de mínimo privilegio**: contenedores corren como usuario no-root; roles granulares en la API
+- **Control de acceso compartido**: un administrador o editor puede otorgar acceso a secretos específicos a otros usuarios sin transferir la propiedad
 
 ---
 
@@ -40,7 +42,7 @@ graph TB
     end
 
     subgraph "Persistencia"
-        PG[(PostgreSQL\ntablas: users\nsecrets\naudit_logs)]
+        PG[(PostgreSQL\ntablas: users\nsecrets\nsecret_access\naudit_logs)]
     end
 
     User --> FE
@@ -110,7 +112,7 @@ sequenceDiagram
     DB-->>GW: User record + hashed_password
 
     alt Credenciales válidas
-        GW->>GW: bcrypt.verify(password, hash)
+        GW->>GW: pbkdf2_sha256.verify(password, hash)
         GW->>GW: Genera JWT (30min) + Refresh Token (7d)
         GW->>DB: INSERT audit_log (LOGIN)
         GW-->>FE: 200 {access_token, refresh_token, role}
@@ -142,7 +144,7 @@ sequenceDiagram
     FE->>GW: POST /api/v1/secrets/ + JWT
     GW->>GW: Valida JWT + rol (viewer bloqueado)
     GW->>ENC: encrypt(valor)
-    ENC-->>GW: valor_cifrado (AES-128)
+    ENC-->>GW: valor_cifrado (Fernet AES-128-CBC)
     GW->>DB: INSERT secret (nombre, cifrado, owner_id)
     GW->>DB: INSERT audit_log (CREATE_SECRET)
     GW->>RMQ: publish → secret_events
@@ -159,7 +161,30 @@ sequenceDiagram
 
 ---
 
-## 6. Diagrama de Casos de Uso
+## 6. Diagrama de Secuencia — Compartir un Secreto
+
+```mermaid
+sequenceDiagram
+    actor A as Admin / Editor (propietario)
+    participant FE as Frontend
+    participant GW as API Gateway
+    participant DB as PostgreSQL
+
+    A->>FE: Selecciona secreto → gestionar accesos → elige usuario
+    FE->>GW: POST /api/v1/secrets/{id}/access + JWT\n{user_ids: [...]}
+    GW->>GW: Valida JWT + rol\n(viewer bloqueado; editor solo puede asignar a viewers)
+    GW->>DB: SELECT secret WHERE id=? (verifica existencia y propiedad)
+    GW->>DB: INSERT secret_access (secret_id, granted_to, granted_by)
+    GW->>DB: INSERT audit_log (GRANT_ACCESS)
+    GW-->>FE: 200 {message, granted_to: [...]}
+    FE-->>A: Acceso otorgado
+
+    Note over FE,DB: El usuario receptor ve el secreto\nen su lista marcado como "shared"
+```
+
+---
+
+## 7. Diagrama de Casos de Uso
 
 ```mermaid
 flowchart LR
@@ -176,11 +201,16 @@ flowchart LR
         UC5[Revelar secreto]
         UC6[Rotar secreto]
         UC7[Eliminar secreto]
-        UC8[Ver audit log completo]
-        UC9[Ver mi audit log]
-        UC10[Ver estadísticas]
-        UC11[Marcar secretos expirados]
-        UC12[Publicar alertas de expiración]
+        UC8[Editar metadatos secreto]
+        UC9[Ver audit log completo]
+        UC10[Ver mi audit log]
+        UC11[Ver estadísticas]
+        UC12[Cambiar contraseña]
+        UC13[Otorgar acceso a secreto]
+        UC14[Revocar acceso a secreto]
+        UC15[Ver accesos de un secreto]
+        UC16[Marcar secretos expirados]
+        UC17[Publicar alertas de expiración]
     end
 
     Admin --> UC1
@@ -191,27 +221,39 @@ flowchart LR
     Admin --> UC6
     Admin --> UC7
     Admin --> UC8
-    Admin --> UC10
+    Admin --> UC9
+    Admin --> UC11
+    Admin --> UC12
+    Admin --> UC13
+    Admin --> UC14
+    Admin --> UC15
 
     Editor --> UC2
     Editor --> UC3
     Editor --> UC4
     Editor --> UC5
     Editor --> UC6
-    Editor --> UC9
+    Editor --> UC7
+    Editor --> UC8
+    Editor --> UC10
+    Editor --> UC12
+    Editor --> UC13
+    Editor --> UC14
+    Editor --> UC15
 
     Viewer --> UC2
     Viewer --> UC4
     Viewer --> UC5
-    Viewer --> UC9
+    Viewer --> UC10
+    Viewer --> UC12
 
-    Worker --> UC11
-    Worker --> UC12
+    Worker --> UC16
+    Worker --> UC17
 ```
 
 ---
 
-## 7. DFD Nivel 0 — Vista General
+## 8. DFD Nivel 0 — Vista General
 
 ```mermaid
 graph LR
@@ -228,7 +270,7 @@ graph LR
 
 ---
 
-## 8. DFD Nivel 1 — Flujos Internos
+## 9. DFD Nivel 1 — Flujos Internos
 
 ```mermaid
 graph TB
@@ -238,10 +280,12 @@ graph TB
     P2[2.0\nGestión de\nSecrets]
     P3[3.0\nAudit\nLogger]
     P4[4.0\nWorker\nAudit]
+    P5[5.0\nControl de\nAcceso]
 
     DS1[(users)]
     DS2[(secrets\ncifrados)]
     DS3[(audit_logs)]
+    DS4[(secret_access)]
     RMQ[(RabbitMQ)]
 
     U -->|username+pass| P1
@@ -253,6 +297,10 @@ graph TB
     P2 -->|secreto cifrado| DS2
     P2 -->|audit event| P3
     P2 -->|secret_event| RMQ
+    P2 -->|delega permisos| P5
+
+    P5 -->|read/write| DS4
+    P5 -->|audit event| P3
 
     P3 -->|INSERT| DS3
 
@@ -263,7 +311,7 @@ graph TB
 
 ---
 
-## 9. Modelo de Datos
+## 10. Modelo de Datos
 
 ```mermaid
 erDiagram
@@ -290,6 +338,14 @@ erDiagram
         TIMESTAMP last_rotated_at
     }
 
+    secret_access {
+        UUID id PK
+        UUID secret_id FK
+        UUID granted_to_user_id FK
+        UUID granted_by_user_id FK
+        TIMESTAMP created_at
+    }
+
     audit_logs {
         UUID id PK
         UUID user_id FK
@@ -303,4 +359,48 @@ erDiagram
 
     users ||--o{ secrets : "owns"
     users ||--o{ audit_logs : "generates"
+    secrets ||--o{ secret_access : "has access grants"
+    users ||--o{ secret_access : "granted_to"
+    users ||--o{ secret_access : "granted_by"
 ```
+
+---
+
+## 11. Decisiones de Diseño
+
+### Cifrado con Fernet
+
+Se eligió Fernet de la librería `cryptography` (AES-128-CBC + HMAC-SHA256) por las siguientes razones:
+
+- Cifrado simétrico autenticado: garantiza confidencialidad e integridad del valor cifrado
+- API simple y segura por defecto: no expone parámetros criptográficos al desarrollador
+- La clave Fernet se inyecta como variable de entorno (`FERNET_KEY`) y nunca se persiste en base de datos
+
+> ⚠️ Si la `FERNET_KEY` se rota en producción, todos los secretos cifrados quedan ilegibles hasta re-cifrarlos con la nueva clave. Este proceso de re-cifrado es responsabilidad del operador y está fuera del alcance de v1.0.
+
+### Autenticación con JWT
+
+- **Access token**: expira en 30 minutos, firmado con HS256 usando `SECRET_KEY`
+- **Refresh token**: expira en 7 días, permite obtener un nuevo access token sin re-login
+- Las contraseñas se almacenan con **PBKDF2-SHA256** via `passlib`
+
+### Control de Acceso Basado en Roles (RBAC)
+
+Tres roles con permisos distintos:
+
+| Rol | Crear | Rotar/Editar/Eliminar | Ver | Compartir |
+|-----|-------|-----------------------|-----|-----------|
+| `admin` | ✅ | ✅ todos | ✅ todos | ✅ cualquier usuario |
+| `editor` | ✅ | ✅ propios + compartidos | ✅ propios + compartidos | ✅ solo a viewers |
+| `viewer` | ❌ | ❌ | ✅ propios + compartidos | ❌ |
+
+### Comunicación Asíncrona con RabbitMQ
+
+El API Gateway publica eventos en la queue `secret_events` tras cada operación sobre secretos. El Worker Audit consume esos eventos de forma independiente, sin bloquear la respuesta al cliente. Esto permite:
+
+- Desacoplamiento entre la lógica de negocio y la lógica de auditoría asíncrona
+- El worker además ejecuta un chequeo periódico cada 30 segundos para marcar secretos como `expired` y publicar alertas en `secret_alerts`
+
+### Audit Log como append-only por convención
+
+El audit log se implementa como `INSERT`-only a nivel de aplicación: ningún endpoint expone operaciones de `UPDATE` o `DELETE` sobre `audit_logs`. No existe un constraint de base de datos que lo fuerce técnicamente, por lo que la garantía de inmutabilidad depende de que no se otorguen permisos directos de escritura a la tabla fuera de la aplicación.
